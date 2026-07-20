@@ -1,0 +1,9 @@
+node_modules/
+dist/
+output/
+backend/benchmark_private/
+backend/newsbrief.db
+backend/__pycache__/
+backend/tests/__pycache__/
+.ruff_cache/
+.playwright-cli/
