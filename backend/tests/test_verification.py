@@ -3,13 +3,16 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from backend import evidence_review
 from backend.samples import SAMPLES
 from backend.summarizer import summarize
 from backend.verification import (
+    BochaSearchProvider,
     build_offline_verification,
+    get_search_provider,
     is_safe_public_url,
     run_online_verification,
 )
@@ -112,6 +115,52 @@ def test_online_verification_uses_source_evidence_without_truth_verdict():
     assert result["sources"][0]["tier"] == "official"
     assert any(claim["status"] == "supported" for claim in result["claims"])
     assert all(claim["status"] in {"supported", "partial", "unverified", "conflicting"} for claim in result["claims"])
+
+
+def test_bocha_provider_maps_structured_web_results_without_leaking_the_key():
+    request_data = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_data["method"] = request.method
+        request_data["url"] = str(request.url)
+        request_data["authorization"] = request.headers.get("Authorization")
+        request_data["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "webPages": {
+                    "value": [
+                        {
+                            "name": "新华社测试来源",
+                            "url": "https://www.xinhuanet.com/example",
+                            "snippet": "用于验证博查搜索结果的标题、链接和摘要映射。",
+                            "datePublished": "2026-08-02T00:00:00+08:00",
+                        }
+                    ]
+                }
+            },
+        )
+
+    async def search():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await BochaSearchProvider().search(client, "中文新闻核验", "test-key-not-returned")
+
+    results = asyncio.run(search())
+
+    assert request_data["method"] == "POST"
+    assert request_data["url"] == "https://api.bochaai.com/v1/web-search"
+    assert request_data["authorization"] == "Bearer test-key-not-returned"
+    assert request_data["payload"] == {"query": "中文新闻核验", "summary": True, "count": 8}
+    assert results == [
+        {
+            "title": "新华社测试来源",
+            "url": "https://www.xinhuanet.com/example",
+            "description": "用于验证博查搜索结果的标题、链接和摘要映射。",
+        }
+    ]
+    assert get_search_provider("bocha").name == "bocha"
+    assert get_search_provider("brave").name == "brave"
 
 
 def test_public_url_guard_rejects_local_or_non_https_destinations():

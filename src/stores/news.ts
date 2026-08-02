@@ -7,6 +7,8 @@ import type {
   Draft,
   HistoryRecord,
   HistorySort,
+  HistoryBackup,
+  HistoryImportResult,
   NewsSample,
   SummaryComparison,
   SummaryComparisonItem,
@@ -23,6 +25,8 @@ const emptyConstraints = (): SelectionConstraints => ({
 const createBlankDraft = (): Draft => ({
   title: '',
   content: '',
+  source_url: null,
+  source_domain: null,
   length: 'standard',
   engine: 'local',
   selection_constraints: emptyConstraints(),
@@ -38,6 +42,8 @@ export const useNewsStore = defineStore('news', () => {
   const isGenerating = ref(false)
   const isComparing = ref(false)
   const isSaving = ref(false)
+  const isImportingArticle = ref(false)
+  const isImportingHistory = ref(false)
   const isVerifyingNews = ref(false)
   const isReviewingEvidence = ref(false)
   const activeHistoryId = ref<number | null>(null)
@@ -99,12 +105,46 @@ export const useNewsStore = defineStore('news', () => {
     }
   }
 
+  async function exportHistoryBackup() {
+    error.value = ''
+    try {
+      return await api.exportHistoryBackup()
+    } catch (reason) {
+      setError(reason, '导出历史备份失败。')
+      return null
+    }
+  }
+
+  async function importHistoryBackup(backup: HistoryBackup): Promise<HistoryImportResult | null> {
+    error.value = ''
+    notice.value = ''
+    isImportingHistory.value = true
+    try {
+      const outcome = await api.importHistoryBackup(backup)
+      notice.value = outcome.imported
+        ? `已导入 ${outcome.imported} 条历史记录${outcome.skipped ? `，跳过 ${outcome.skipped} 条重复记录` : ''}。`
+        : `没有导入新记录，已跳过 ${outcome.skipped} 条重复记录。`
+      return outcome
+    } catch (reason) {
+      setError(reason, '导入历史备份失败，请确认文件来自 NewsBrief。')
+      return null
+    } finally {
+      isImportingHistory.value = false
+    }
+  }
+
   async function generate() {
     error.value = ''
     notice.value = ''
     isGenerating.value = true
     try {
-      const result = await api.summarize(draft.value)
+      const result = await api.summarize({
+        title: draft.value.title,
+        content: draft.value.content,
+        length: draft.value.length,
+        engine: draft.value.engine,
+        selection_constraints: draft.value.selection_constraints,
+      })
       currentResult.value = result
       comparison.value = null
       activeHistoryId.value = null
@@ -113,6 +153,33 @@ export const useNewsStore = defineStore('news', () => {
       error.value = reason instanceof Error ? reason.message : '摘要生成失败，请稍后再试。'
     } finally {
       isGenerating.value = false
+    }
+  }
+
+  async function importArticle(url: string): Promise<boolean> {
+    error.value = ''
+    notice.value = ''
+    isImportingArticle.value = true
+    try {
+      const article = await api.importArticle(url)
+      draft.value = {
+        ...draft.value,
+        title: article.title,
+        content: article.content,
+        source_url: article.source_url,
+        source_domain: article.source_domain,
+        selection_constraints: emptyConstraints(),
+      }
+      currentResult.value = null
+      comparison.value = null
+      activeHistoryId.value = null
+      notice.value = `已导入 ${article.source_domain} 的新闻内容，请确认后生成摘要。`
+      return true
+    } catch (reason) {
+      setError(reason, '新闻链接导入失败，请手动粘贴正文。')
+      return false
+    } finally {
+      isImportingArticle.value = false
     }
   }
 
@@ -166,6 +233,8 @@ export const useNewsStore = defineStore('news', () => {
       ...draft.value,
       title: sample.title,
       content: sample.content,
+      source_url: null,
+      source_domain: null,
       selection_constraints: emptyConstraints(),
     }
     currentResult.value = null
@@ -178,6 +247,8 @@ export const useNewsStore = defineStore('news', () => {
     draft.value = {
       title: record.title,
       content: record.content,
+      source_url: record.source_url,
+      source_domain: record.source_domain,
       length: record.length,
       engine: record.engine,
       selection_constraints: { ...record.selection_constraints },
@@ -317,6 +388,8 @@ export const useNewsStore = defineStore('news', () => {
     isGenerating,
     isComparing,
     isSaving,
+    isImportingArticle,
+    isImportingHistory,
     isVerifyingNews,
     isReviewingEvidence,
     activeHistoryId,
@@ -331,6 +404,9 @@ export const useNewsStore = defineStore('news', () => {
     configureAI,
     configureSearch,
     refreshHistory,
+    exportHistoryBackup,
+    importHistoryBackup,
+    importArticle,
     generate,
     compareLengths,
     useComparison,

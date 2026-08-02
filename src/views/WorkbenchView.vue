@@ -11,6 +11,7 @@ import {
   Download,
   FileText,
   ExternalLink,
+  Link,
   Pin,
   RefreshCw,
   RotateCcw,
@@ -19,6 +20,7 @@ import {
   Sparkles,
   Trash2,
   WandSparkles,
+  X,
 } from '@lucide/vue'
 import { RouterLink } from 'vue-router'
 import { useNewsStore } from '../stores/news'
@@ -27,8 +29,22 @@ import type { NewsSample, SummaryComparisonItem, SummaryLength, VerificationStat
 const store = useNewsStore()
 const copied = ref(false)
 const showSamples = ref(false)
+const articleUrl = ref('')
 const activeTab = ref<'summary' | 'facts' | 'verification' | 'evidence' | 'compare'>('summary')
 const highlightedSentence = ref<number | null>(null)
+const directImageExtensions = [
+  '.avif',
+  '.bmp',
+  '.gif',
+  '.heic',
+  '.jpeg',
+  '.jpg',
+  '.png',
+  '.svg',
+  '.webp',
+]
+const directVideoExtensions = ['.avi', '.flv', '.m4v', '.mkv', '.mov', '.mp4', '.webm']
+const knownDynamicArticleHosts = ['msn.com', 'msn.cn']
 
 const characterCount = computed(() => store.draft.content.replace(/\s/g, '').length)
 const result = computed(() => store.currentResult)
@@ -128,6 +144,7 @@ function exportSummary() {
     ...result.value.bullets.map((item) => `- ${item.text}`),
     '',
     `关键词：${result.value.keywords.join('、')}`,
+    ...(store.draft.source_url ? [`原始新闻链接：${store.draft.source_url}`] : []),
     `摘要引擎：${result.value.engine_label}`,
   ].join('\n')
   const link = document.createElement('a')
@@ -168,6 +185,53 @@ function loadMenuSample(sample: NewsSample) {
   showSamples.value = false
   activeTab.value = 'summary'
 }
+
+function directMediaResourceLabel(url: string): string | null {
+  const pathname = new URL(url).pathname.toLowerCase()
+  if (directImageExtensions.some((extension) => pathname.endsWith(extension))) return '图片'
+  if (directVideoExtensions.some((extension) => pathname.endsWith(extension))) return '视频'
+  return null
+}
+
+function isKnownDynamicArticleUrl(url: string): boolean {
+  const hostname = new URL(url).hostname.toLowerCase()
+  return knownDynamicArticleHosts.some((host) => hostname === host || hostname.endsWith(`.${host}`))
+}
+
+async function importFromLink() {
+  const url = articleUrl.value.trim()
+  if (!url) return
+  try {
+    if (new URL(url).protocol !== 'https:') throw new Error()
+  } catch {
+    store.error = '请输入有效的 HTTPS 新闻链接。'
+    return
+  }
+  const mediaResource = directMediaResourceLabel(url)
+  if (mediaResource) {
+    store.error = `该链接是${mediaResource}资源，无法提取新闻正文。请提供对应新闻报道网页链接或手动粘贴文字稿。`
+    return
+  }
+  if (isKnownDynamicArticleUrl(url)) {
+    store.error =
+      '该 MSN 新闻页需要在浏览器中动态加载正文，当前无法可靠提取。请粘贴原始发布媒体的报道链接，或手动复制标题和文字正文。'
+    return
+  }
+  if (
+    (store.draft.title.trim() || store.draft.content.trim()) &&
+    !window.confirm('导入新闻链接会替换当前标题、正文和来源信息，是否继续？')
+  ) {
+    return
+  }
+  if (await store.importArticle(url)) articleUrl.value = ''
+}
+
+function removeArticleSource() {
+  store.draft.source_url = null
+  store.draft.source_domain = null
+  articleUrl.value = ''
+  store.notice = '已移除当前草稿的来源链接。'
+}
 </script>
 
 <template>
@@ -198,6 +262,47 @@ function loadMenuSample(sample: NewsSample) {
           <Trash2 :size="17" />
         </button>
       </header>
+
+      <section class="article-import" aria-label="新闻链接导入">
+        <label class="field-label" for="article-url"
+          >新闻链接导入 <span>仅支持公开 HTTPS 新闻报道页</span></label
+        >
+        <div class="article-import-row">
+          <Link :size="16" aria-hidden="true" />
+          <input
+            id="article-url"
+            v-model="articleUrl"
+            type="url"
+            inputmode="url"
+            autocomplete="url"
+            placeholder="粘贴新闻报道页链接，自动提取标题和正文"
+            :disabled="store.isImportingArticle"
+            @keydown.enter.prevent="importFromLink"
+          />
+          <button
+            type="button"
+            :disabled="store.isImportingArticle || !articleUrl.trim()"
+            @click="importFromLink"
+          >
+            <span v-if="store.isImportingArticle" class="spinner teal"></span>
+            <Link v-else :size="16" />{{ store.isImportingArticle ? '正在提取' : '导入' }}
+          </button>
+        </div>
+        <div v-if="store.draft.source_url" class="article-source">
+          <ExternalLink :size="14" />
+          <a :href="store.draft.source_url" target="_blank" rel="noopener noreferrer">
+            来源：{{ store.draft.source_domain || '已导入新闻' }}
+          </a>
+          <button
+            type="button"
+            title="移除来源链接"
+            aria-label="移除来源链接"
+            @click="removeArticleSource"
+          >
+            <X :size="14" />
+          </button>
+        </div>
+      </section>
 
       <label class="field-label" for="news-title">新闻标题 <span>可选</span></label>
       <input

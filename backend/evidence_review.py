@@ -14,6 +14,8 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 MAX_REVIEW_SOURCES = 6
+AI_REVIEW_MAX_TOKENS = 5200
+AI_REVIEW_TIMEOUT_SECONDS = 45
 HIGH_TRUST_TIERS = {"official", "established_media"}
 SUGGESTED_STATUSES = {"supported", "partial", "unverified", "conflicting"}
 
@@ -143,8 +145,8 @@ def review_evidence_with_ai(
         ],
         temperature=0,
         response_format={"type": "json_object"},
-        max_tokens=1200,
-        timeout=15,
+        max_tokens=AI_REVIEW_MAX_TOKENS,
+        timeout=AI_REVIEW_TIMEOUT_SECONDS,
     )
     content = response.choices[0].message.content or "{}"
     try:

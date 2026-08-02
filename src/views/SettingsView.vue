@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import {
   Check,
   CircleAlert,
@@ -18,6 +18,7 @@ import {
 } from '@lucide/vue'
 import { api } from '../api'
 import { useNewsStore } from '../stores/news'
+import type { SearchProvider } from '../types'
 
 const store = useNewsStore()
 const showApiKey = ref(false)
@@ -35,7 +36,18 @@ const config = reactive({
   baseUrl: 'https://api.deepseek.com',
   model: 'deepseek-chat',
 })
-const searchConfig = reactive({ apiKey: '' })
+const searchConfig = reactive<{ provider: SearchProvider; apiKey: string }>({
+  provider: 'bocha',
+  apiKey: '',
+})
+const searchProviderLabel = computed(() =>
+  searchConfig.provider === 'bocha' ? '博查 Web Search' : 'Brave Search',
+)
+const searchProviderHint = computed(() =>
+  searchConfig.provider === 'bocha'
+    ? '面向中文新闻的国内默认检索服务。'
+    : '适合国际新闻或已有 Brave Key 的用户。',
+)
 
 function syncConfigDefaults() {
   const ai = store.capabilities?.ai_engine
@@ -44,9 +56,15 @@ function syncConfigDefaults() {
   config.model = ai.model
 }
 
+function syncSearchConfigDefaults() {
+  const provider = store.capabilities?.verification_engine.provider
+  if (provider) searchConfig.provider = provider
+}
+
 onMounted(async () => {
   if (!store.capabilities) await store.bootstrap()
   syncConfigDefaults()
+  syncSearchConfigDefaults()
 })
 
 async function saveAIConfig() {
@@ -107,15 +125,19 @@ async function saveSearchConfig() {
   searchError.value = ''
   searchNotice.value = ''
   if (!searchConfig.apiKey.trim()) {
-    searchError.value = '请输入 Brave Search API Key 后再保存。'
+    searchError.value = `请输入 ${searchProviderLabel.value} API Key 后再保存。`
     return
   }
   isSavingSearch.value = true
   try {
-    await store.configureSearch({ api_key: searchConfig.apiKey.trim() })
+    await store.configureSearch({
+      provider: searchConfig.provider,
+      api_key: searchConfig.apiKey.trim(),
+    })
     searchConfig.apiKey = ''
     showSearchKey.value = false
-    searchNotice.value = '公开来源检索已配置，可在核验线索中主动发起搜索。'
+    syncSearchConfigDefaults()
+    searchNotice.value = `${searchProviderLabel.value} 已配置，可在核验线索中主动发起搜索。`
   } catch (reason) {
     searchError.value = reason instanceof Error ? reason.message : '搜索服务配置保存失败。'
   } finally {
@@ -127,12 +149,15 @@ async function verifySearchConfig() {
   searchError.value = ''
   searchNotice.value = ''
   if (!searchConfig.apiKey.trim()) {
-    searchError.value = '请输入 Brave Search API Key 后再测试连接。'
+    searchError.value = `请输入 ${searchProviderLabel.value} API Key 后再测试连接。`
     return
   }
   isVerifyingSearch.value = true
   try {
-    const result = await api.verifySearch({ api_key: searchConfig.apiKey.trim() })
+    const result = await api.verifySearch({
+      provider: searchConfig.provider,
+      api_key: searchConfig.apiKey.trim(),
+    })
     if (result.available) {
       searchNotice.value = '连接成功。该 Key 尚未保存。'
     } else {
@@ -261,21 +286,29 @@ async function verifySearchConfig() {
       <div class="setting-icon"><Search :size="20" /></div>
       <div class="ai-config-heading">
         <p class="panel-kicker">公开来源检索</p>
-        <h2>连接 Brave Search API</h2>
+        <h2>配置公开来源检索</h2>
         <p>
-          仅在你点击“开始联网核验”时，系统才会发送由新闻主体、事件、时间或数值组成的短查询；不会上传整篇新闻正文。
+          默认使用适合中文新闻的博查 Web Search，也可切换为 Brave
+          国际来源检索。仅在你点击“开始联网核验”时，系统才会发送由新闻主体、事件、时间或数值组成的短查询；不会上传整篇新闻正文。
           密钥仅保存到本机 <code>backend/.env</code>，不会出现在历史、导出文件或页面回显中。
         </p>
       </div>
       <form class="ai-config-form search-config-form" @submit.prevent="saveSearchConfig">
+        <label class="setting-field">
+          <span>搜索服务</span>
+          <select v-model="searchConfig.provider" aria-label="选择公开来源检索服务">
+            <option value="bocha">博查 Web Search（国内默认）</option>
+            <option value="brave">Brave Search（国际来源）</option>
+          </select>
+        </label>
         <label class="setting-field key-field">
-          <span>Brave Search API Key</span>
+          <span>{{ searchProviderLabel }} API Key</span>
           <div class="secret-input">
             <input
               v-model="searchConfig.apiKey"
               :type="showSearchKey ? 'text' : 'password'"
               autocomplete="off"
-              placeholder="粘贴 Brave Search API Key"
+              :placeholder="`粘贴 ${searchProviderLabel} API Key`"
             />
             <button
               type="button"
@@ -287,9 +320,9 @@ async function verifySearchConfig() {
             </button>
           </div>
         </label>
-        <div class="search-provider-note">
-          <span>搜索提供方</span><strong>Brave Search API</strong>
-        </div>
+        <p class="search-provider-note">
+          <strong>{{ searchProviderHint }}</strong>
+        </p>
         <div class="ai-config-actions">
           <button
             class="ai-verify-button"

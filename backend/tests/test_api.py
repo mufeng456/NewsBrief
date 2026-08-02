@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend import benchmarks, main
+from backend import benchmarks, main, verification
 from backend.main import app
 from backend.samples import SAMPLES
 
@@ -89,8 +89,177 @@ def test_health_and_capabilities():
         assert client.get("/api/health").json() == {"status": "ok"}
         capabilities = client.get("/api/capabilities").json()
         assert capabilities["local_engine"]["enabled"] is True
-        assert capabilities["verification_engine"]["provider"] == "brave"
+        assert capabilities["verification_engine"]["provider"] == "bocha"
+        assert capabilities["verification_engine"]["provider_label"] == "博查 Web Search（国内默认）"
         assert capabilities["limits"]["max_characters"] == 8000
+
+
+def test_article_import_extracts_a_bounded_editable_article_without_writing_history(monkeypatch):
+    long_content = "第一段新闻正文。" * 1200
+
+    async def fake_fetcher(_client, _url):
+        return {
+            "title": "导入测试新闻",
+            "url": "https://news.example.com/article/1",
+            "domain": "news.example.com",
+            "tier": "other",
+            "text": f"{long_content}\n第二段新闻正文。" * 3,
+            "content_sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(main, "fetch_public_page", fake_fetcher)
+    with TestClient(app) as client:
+        before = client.get("/api/history").json()
+        response = client.post("/api/articles/import", json={"url": "https://example.com/news"})
+        after = client.get("/api/history").json()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["title"] == "导入测试新闻"
+    assert payload["source_url"] == "https://news.example.com/article/1"
+    assert payload["source_domain"] == "news.example.com"
+    assert len(payload["content"].replace("\n", "")) <= 8000
+    assert before == after == []
+
+
+def test_extract_page_reads_cctv_style_embedded_article_content():
+    html = """
+    <html><head><title>央视测试新闻</title></head><body>
+    <div id="content_area">正在加载</div>
+    <script>
+      var contentdate = '<p>[!--begin:htmlVideoCode--]video-id,0[!--end:htmlVideoCode--]</p><p>央视网消息：这是第一段具有足够长度的新闻正文，用于验证静态页面中的内嵌内容提取。</p><p>这是第二段具有足够长度的新闻正文，确保提取结果不会依赖浏览器执行页面脚本。</p>'
+    </script>
+    </body></html>
+    """
+
+    title, text = verification._extract_page(html, "fallback.example.com")
+
+    assert title == "央视测试新闻"
+    assert "第一段具有足够长度" in text
+    assert "第二段具有足够长度" in text
+    assert "htmlVideoCode" not in text
+
+
+def test_extract_page_reads_standard_jsonld_article_body_and_metadata_title():
+    html = """
+    <html><head>
+      <meta property="og:title" content="JSON-LD 新闻标题">
+      <title>站点标题 - 不应优先</title>
+      <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "NewsArticle",
+          "headline": "JSON-LD 内嵌标题",
+          "articleBody": "第一段 JSON-LD 正文包含完整新闻背景和事件进展，用于验证结构化数据提取。\n第二段 JSON-LD 正文补充了公开信息和后续安排，确保内容可用于摘要。"
+        }
+      </script>
+    </head><body><p>页面侧栏中的无关短文案。</p></body></html>
+    """
+
+    title, text = verification._extract_page(html, "fallback.example.com")
+
+    assert title == "JSON-LD 新闻标题"
+    assert "第一段 JSON-LD 正文" in text
+    assert "第二段 JSON-LD 正文" in text
+    assert "侧栏中的无关" not in text
+
+
+def test_extract_page_prefers_semantic_article_container_over_page_chrome():
+    html = """
+    <html><head><title>容器新闻标题</title></head><body>
+      <aside><p>推荐阅读：这是侧栏推荐内容，不应被当作新闻正文导入工作台。</p></aside>
+      <div class="article-content">
+        <p>正文第一段说明了本次新闻事件的起因、参与主体和已经公开的处理安排。</p>
+        <p>正文第二段补充了相关数据、时间节点以及后续将持续公布的进展信息。</p>
+      </div>
+      <footer><p>网站页脚版权与服务说明，不能进入用户导入的新闻正文。</p></footer>
+    </body></html>
+    """
+
+    title, text = verification._extract_page(html, "fallback.example.com")
+
+    assert title == "容器新闻标题"
+    assert "正文第一段说明" in text
+    assert "正文第二段补充" in text
+    assert "侧栏推荐内容" not in text
+    assert "网站页脚版权" not in text
+
+
+def test_extract_page_reads_article_body_from_framework_json_and_gb18030_page():
+    json_html = """
+    <html><head><title>框架数据标题</title></head><body>
+      <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"article":{"type":"NewsArticle","headline":"框架内嵌标题","articleBody":"框架数据第一段新闻正文具备足够长度，可从应用状态中安全读取。\\n框架数据第二段新闻正文说明事件进展，不需要执行页面脚本。"}}}}
+      </script>
+    </body></html>
+    """
+    encoded_html = """
+    <html><head><meta charset="gbk"><title>编码新闻标题</title></head><body>
+      <div id="articleContent"><p>编码页面第一段新闻正文用于验证 GB18030 兼容解码和中文内容提取。</p>
+      <p>编码页面第二段新闻正文补充了足够的信息，确保正文能够正常回填。</p></div>
+    </body></html>
+    """.encode("gb18030")
+
+    framework_title, framework_text = verification._extract_page(json_html, "fallback.example.com")
+    decoded_html = verification._decode_page_html(encoded_html, "text/html; charset=gbk")
+    encoded_title, encoded_text = verification._extract_page(decoded_html, "fallback.example.com")
+
+    assert framework_title == "框架内嵌标题"
+    assert "框架数据第一段新闻正文" in framework_text
+    assert "框架数据第二段新闻正文" in framework_text
+    assert encoded_title == "编码新闻标题"
+    assert "GB18030 兼容解码" in encoded_text
+
+
+def test_article_import_rejects_invalid_or_unextractable_links(monkeypatch):
+    async def unavailable_fetcher(_client, _url):
+        return None
+
+    monkeypatch.setattr(main, "fetch_public_page", unavailable_fetcher)
+    with TestClient(app) as client:
+        invalid = client.post("/api/articles/import", json={"url": "http://example.com/news"})
+        unavailable = client.post("/api/articles/import", json={"url": "https://example.com/news"})
+
+    assert invalid.status_code == 422
+    assert unavailable.status_code == 422
+    assert "手动粘贴" in unavailable.json()["detail"]
+
+
+def test_article_import_explains_known_dynamic_msn_pages(monkeypatch):
+    async def unavailable_fetcher(_client, _url):
+        return None
+
+    monkeypatch.setattr(main, "fetch_public_page", unavailable_fetcher)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/articles/import",
+            json={"url": "https://www.msn.cn/zh-cn/news/other/example/ar-AA29aMVW"},
+        )
+
+    assert response.status_code == 422
+    assert "MSN" in response.json()["detail"]
+    assert "动态加载" in response.json()["detail"]
+    assert "原始发布媒体" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("url", "resource_label"),
+    [
+        ("https://cdn.example.com/news/photo.JPG?size=large", "图片"),
+        ("https://cdn.example.com/news/report.mp4", "视频"),
+    ],
+)
+def test_article_import_rejects_direct_media_resources(monkeypatch, url, resource_label):
+    async def should_not_fetch(*_args, **_kwargs):
+        raise AssertionError("直接媒体资源不应进入网页抓取流程")
+
+    monkeypatch.setattr(main, "fetch_public_page", should_not_fetch)
+    with TestClient(app) as client:
+        response = client.post("/api/articles/import", json={"url": url})
+
+    assert response.status_code == 422
+    assert resource_label in response.json()["detail"]
+    assert "新闻报道网页链接" in response.json()["detail"]
 
 
 def test_application_factory_accepts_an_isolated_database_url():
@@ -218,6 +387,8 @@ def test_ai_evidence_review_is_source_cited_and_persists_with_history(monkeypatc
             json={
                 "title": sample["title"],
                 "content": sample["content"],
+                "source_url": "https://news.example.com/article/7",
+                "source_domain": "news.example.com",
                 "length": "standard",
                 "result": result,
             },
@@ -435,20 +606,49 @@ def test_search_configuration_rejects_blank_key_after_trimming():
 
 
 def test_search_connection_verification_never_returns_the_key(monkeypatch):
-    async def available(_):
+    async def available(provider, _):
+        assert provider == "bocha"
         return {
             "available": True,
-            "provider": "brave",
+            "provider": "bocha",
             "message": "公开来源检索服务连接成功。",
         }
 
-    monkeypatch.setattr(main, "verify_brave_connection", available)
+    monkeypatch.setattr(main, "verify_search_connection", available)
     secret = "search-key-that-is-never-returned"
     with TestClient(app) as client:
-        response = client.post("/api/search-config/verify", json={"api_key": secret})
+        response = client.post(
+            "/api/search-config/verify", json={"provider": "bocha", "api_key": secret}
+        )
     assert response.status_code == 200
     assert response.json()["available"] is True
+    assert response.json()["provider"] == "bocha"
     assert secret not in response.text
+
+
+def test_search_configuration_saves_selected_provider_without_returning_the_key(monkeypatch):
+    config_path = Path(__file__).with_name(".search-config-test.env")
+    config_path.unlink(missing_ok=True)
+    monkeypatch.setattr(main, "AI_ENV_PATH", config_path)
+    monkeypatch.setenv("SEARCH_PROVIDER", "bocha")
+    monkeypatch.setenv("SEARCH_API_KEY", "")
+    secret = "brave-key-that-is-never-returned"
+    try:
+        with TestClient(app) as client:
+            response = client.put(
+                "/api/search-config", json={"provider": "brave", "api_key": secret}
+            )
+        assert response.status_code == 200
+        capability = response.json()["verification_engine"]
+        assert capability["enabled"] is True
+        assert capability["provider"] == "brave"
+        assert capability["provider_label"] == "Brave Search（国际来源）"
+        assert secret not in response.text
+        saved = config_path.read_text(encoding="utf-8")
+        assert "SEARCH_PROVIDER=brave" in saved
+        assert f"SEARCH_API_KEY={secret}" in saved
+    finally:
+        config_path.unlink(missing_ok=True)
 
 
 def test_ai_connection_verification_never_returns_the_key(monkeypatch):
@@ -525,3 +725,56 @@ def test_history_can_save_and_update():
         assert sorted_history[0]["id"] == record_id
         assert sorted_history[0]["quality"]["evidence_coverage"] == 100
         client.delete(f"/api/history/{record_id}")
+
+
+def test_history_backup_import_restores_records_and_skips_duplicates():
+    sample = SAMPLES[3]
+    with TestClient(app) as client:
+        summary = client.post(
+            "/api/summaries",
+            json={
+                "title": sample["title"],
+                "content": sample["content"],
+                "length": "standard",
+                "engine": "local",
+            },
+        ).json()
+        saved = client.post(
+            "/api/history",
+            json={
+                "title": sample["title"],
+                "content": sample["content"],
+                "source_url": "https://news.example.com/article/7",
+                "source_domain": "news.example.com",
+                "length": "standard",
+                "result": summary,
+            },
+        )
+        record_id = saved.json()["id"]
+        client.patch(f"/api/history/{record_id}", json={"favorite": True, "rating": 4})
+
+        backup = client.get("/api/history/backup")
+        assert backup.status_code == 200
+        assert backup.json()["format_version"] == 1
+        assert len(backup.json()["records"]) == 1
+        assert "api_key" not in backup.text.lower()
+
+        client.delete("/api/history")
+        imported = client.post("/api/history/import", json=backup.json())
+        assert imported.status_code == 200, imported.json()
+        assert imported.json() == {"imported": 1, "skipped": 0}
+
+        restored = client.get("/api/history").json()
+        assert len(restored) == 1
+        assert restored[0]["favorite"] is True
+        assert restored[0]["rating"] == 4
+        assert restored[0]["facts"] == summary["facts"]
+        assert restored[0]["source_url"] == "https://news.example.com/article/7"
+        assert restored[0]["source_domain"] == "news.example.com"
+
+        duplicate = client.post("/api/history/import", json=backup.json())
+        assert duplicate.status_code == 200
+        assert duplicate.json() == {"imported": 0, "skipped": 1}
+
+        invalid = client.post("/api/history/import", json={"format_version": 1, "records": [{}]})
+        assert invalid.status_code == 422

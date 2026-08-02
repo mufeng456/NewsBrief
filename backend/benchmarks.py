@@ -59,7 +59,7 @@ def _empty_methods() -> list[dict[str, Any]]:
 def benchmark_overview() -> dict[str, Any]:
     available = ARTICLES_PATH.exists() and ANNOTATIONS_PATH.exists()
     return {
-        "version": "2.2.0",
+        "version": "2.3.0",
         "dataset": {
             "total": 60,
             "categories": CATEGORIES,

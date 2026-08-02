@@ -37,13 +37,17 @@ onBeforeUnmount(() => {
       <nav aria-label="主导航">
         <RouterLink to="/" class="nav-link"><BookOpenText :size="17" />摘要工作台</RouterLink
         ><RouterLink to="/history" class="nav-link"><Archive :size="17" />历史记录</RouterLink
-        ><RouterLink to="/evaluation" class="nav-link"
-          ><ChartNoAxesCombined :size="17" />评测中心</RouterLink
         ><RouterLink to="/settings" class="nav-link"><Settings2 :size="17" />设置</RouterLink>
       </nav>
       <span class="header-note">中文新闻摘要工具</span>
     </header>
     <main class="app-main"><RouterView /></main>
-    <footer class="app-footer"><span>NewsBrief</span><span>本地优先 · 原文可追溯</span></footer>
+    <footer class="app-footer">
+      <span>NewsBrief</span>
+      <RouterLink to="/evaluation" class="footer-evaluation-link">
+        <ChartNoAxesCombined :size="14" />算法与质量说明
+      </RouterLink>
+      <span>本地优先 · 原文可追溯</span>
+    </footer>
   </div>
 </template>

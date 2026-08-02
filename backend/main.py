@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -40,9 +41,11 @@ from .summarizer import SummarizationError, calculate_redundancy_risk, compare_s
 from .verification import (
     MAX_SOURCES,
     build_offline_verification,
+    fetch_public_page,
+    get_search_provider,
     offline_verification_for_article,
     run_online_verification,
-    verify_brave_connection,
+    verify_search_connection,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -53,7 +56,17 @@ AI_ENV_DEFAULTS = {
     "AI_BASE_URL": "https://api.deepseek.com",
     "AI_MODEL": "deepseek-chat",
 }
-SEARCH_ENV_DEFAULTS = {"SEARCH_PROVIDER": "brave"}
+SEARCH_ENV_DEFAULTS = {"SEARCH_PROVIDER": "bocha"}
+SEARCH_PROVIDER_LABELS = {
+    "bocha": "博查 Web Search（国内默认）",
+    "brave": "Brave Search（国际来源）",
+}
+MAX_ARTICLE_CONTENT_CHARACTERS = 8000
+MEDIA_RESOURCE_EXTENSIONS = {
+    "image": {".avif", ".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".svg", ".webp"},
+    "video": {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".webm"},
+}
+KNOWN_DYNAMIC_ARTICLE_HOSTS = {"msn.com", "msn.cn"}
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -75,6 +88,8 @@ class HistoryRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     title: Mapped[str] = mapped_column(String(180))
     content: Mapped[str] = mapped_column(Text)
+    source_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    source_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
     summary: Mapped[str] = mapped_column(Text)
     bullets_json: Mapped[str] = mapped_column(Text)
     keywords_json: Mapped[str] = mapped_column(Text)
@@ -276,8 +291,51 @@ class HistorySummaryResult(StrictPayload):
 class HistoryCreateRequest(StrictPayload):
     title: str = Field(default="", max_length=180)
     content: str = Field(min_length=80, max_length=8000)
+    source_url: str | None = Field(default=None, max_length=2048)
+    source_domain: str | None = Field(default=None, max_length=255)
     length: Literal["brief", "standard", "detailed"]
     result: HistorySummaryResult
+
+    @field_validator("source_url")
+    @classmethod
+    def validate_source_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        parsed = urlparse(cleaned)
+        if not cleaned or parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("来源链接必须是有效的 HTTPS 公开地址")
+        return cleaned
+
+    @field_validator("source_domain")
+    @classmethod
+    def normalize_source_domain(cls, value: str | None) -> str | None:
+        return value.strip().lower() if value and value.strip() else None
+
+
+class ArticleImportRequest(StrictPayload):
+    url: str = Field(min_length=8, max_length=2048)
+
+    @field_validator("url")
+    @classmethod
+    def validate_article_url(cls, value: str) -> str:
+        cleaned = value.strip()
+        parsed = urlparse(cleaned)
+        if not cleaned or parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("请输入有效的 HTTPS 新闻链接")
+        return cleaned
+
+
+class HistoryImportRecord(HistoryCreateRequest):
+    favorite: bool = False
+    rating: int | None = Field(default=None, ge=1, le=5)
+    created_at: datetime
+
+
+class HistoryImportRequest(StrictPayload):
+    format_version: Literal[1]
+    exported_at: datetime
+    records: list[HistoryImportRecord] = Field(min_length=1, max_length=200)
 
 
 class HistoryUpdateRequest(StrictPayload):
@@ -296,6 +354,7 @@ class AIEvidenceReviewRequest(StrictPayload):
 
 
 class SearchConfigRequest(StrictPayload):
+    provider: Literal["bocha", "brave"] = "bocha"
     api_key: str = Field(min_length=10, max_length=512)
 
     @field_validator("api_key")
@@ -414,6 +473,8 @@ def serialize_record(record: HistoryRecord) -> dict:
         "id": record.id,
         "title": record.title,
         "content": record.content,
+        "source_url": record.source_url,
+        "source_domain": record.source_domain,
         "summary": record.summary,
         "bullets": bullets,
         "keywords": json.loads(record.keywords_json),
@@ -438,6 +499,79 @@ def serialize_record(record: HistoryRecord) -> dict:
         "favorite": record.favorite,
         "rating": record.rating,
         "created_at": record.created_at.isoformat(),
+    }
+
+
+def create_history_record(
+    request: HistoryCreateRequest,
+    *,
+    favorite: bool = False,
+    rating: int | None = None,
+    created_at: datetime | None = None,
+) -> HistoryRecord:
+    result = request.result
+    return HistoryRecord(
+        title=result.title or request.title,
+        content=request.content,
+        source_url=request.source_url,
+        source_domain=request.source_domain,
+        summary=result.summary,
+        bullets_json=json.dumps(
+            [bullet.model_dump() for bullet in result.bullets], ensure_ascii=False
+        ),
+        keywords_json=json.dumps(result.keywords, ensure_ascii=False),
+        selected_ids_json=json.dumps(result.selected_sentence_ids),
+        source_sentences_json=json.dumps(
+            [sentence.model_dump() for sentence in result.source_sentences], ensure_ascii=False
+        ),
+        quality_json=json.dumps(result.quality.model_dump()),
+        facts_json=json.dumps([fact.model_dump() for fact in result.facts], ensure_ascii=False),
+        constraints_json=json.dumps(result.selection_constraints.model_dump()),
+        verification_json=json.dumps(
+            result.verification.model_dump() if result.verification else None,
+            ensure_ascii=False,
+        ),
+        length=request.length,
+        engine=result.engine,
+        engine_label=result.engine_label,
+        original_characters=result.metrics.original_characters,
+        summary_characters=result.metrics.summary_characters,
+        compression_ratio=str(result.metrics.compression_ratio),
+        processing_ms=result.processing_ms,
+        favorite=favorite,
+        rating=rating,
+        created_at=created_at or datetime.now(),
+    )
+
+
+def serialize_backup_record(record: HistoryRecord) -> dict:
+    serialized = serialize_record(record)
+    result_keys = (
+        "title",
+        "summary",
+        "bullets",
+        "keywords",
+        "source_sentences",
+        "selected_sentence_ids",
+        "metrics",
+        "quality",
+        "engine",
+        "engine_label",
+        "processing_ms",
+        "facts",
+        "selection_constraints",
+        "verification",
+    )
+    return {
+        "title": serialized["title"],
+        "content": serialized["content"],
+        "source_url": serialized["source_url"],
+        "source_domain": serialized["source_domain"],
+        "length": serialized["length"],
+        "favorite": serialized["favorite"],
+        "rating": serialized["rating"],
+        "created_at": serialized["created_at"],
+        "result": {key: serialized[key] for key in result_keys},
     }
 
 
@@ -522,15 +656,22 @@ def search_configured() -> bool:
     return bool(os.getenv("SEARCH_API_KEY"))
 
 
+def configured_search_provider() -> str:
+    provider = os.getenv("SEARCH_PROVIDER", SEARCH_ENV_DEFAULTS["SEARCH_PROVIDER"]).strip().lower()
+    return provider if provider in SEARCH_PROVIDER_LABELS else SEARCH_ENV_DEFAULTS["SEARCH_PROVIDER"]
+
+
 def search_settings() -> dict:
     configured = search_configured()
+    provider = configured_search_provider()
     return {
         "enabled": configured,
-        "provider": os.getenv("SEARCH_PROVIDER", SEARCH_ENV_DEFAULTS["SEARCH_PROVIDER"]),
+        "provider": provider,
+        "provider_label": SEARCH_PROVIDER_LABELS[provider],
         "label": "公开来源核验",
-        "message": "已配置，可在核验线索中主动检索公开来源。"
+        "message": f"已配置 {SEARCH_PROVIDER_LABELS[provider]}，可在核验线索中主动检索公开来源。"
         if configured
-        else "尚未配置搜索 API Key，仍可使用离线核验线索。",
+        else f"尚未配置 {SEARCH_PROVIDER_LABELS[provider]} API Key，仍可使用离线核验线索。",
         "max_sources": MAX_SOURCES,
     }
 
@@ -538,7 +679,7 @@ def search_settings() -> dict:
 def save_search_environment(config: SearchConfigRequest) -> None:
     _save_environment_values(
         {
-            "SEARCH_PROVIDER": SEARCH_ENV_DEFAULTS["SEARCH_PROVIDER"],
+            "SEARCH_PROVIDER": config.provider,
             "SEARCH_API_KEY": config.api_key,
         }
     )
@@ -688,6 +829,12 @@ async def lifespan(_: FastAPI):
             connection.execute(
                 text("ALTER TABLE history_records ADD COLUMN verification_json TEXT DEFAULT 'null'")
             )
+    if "source_url" not in history_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE history_records ADD COLUMN source_url TEXT"))
+    if "source_domain" not in history_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE history_records ADD COLUMN source_domain TEXT"))
     yield
 
 
@@ -733,11 +880,11 @@ def update_search_config(config: SearchConfigRequest):
 @api_router.post("/api/search-config/verify")
 async def verify_search_config(config: SearchConfigRequest):
     try:
-        return await verify_brave_connection(config.api_key)
+        return await verify_search_connection(config.provider, config.api_key)
     except Exception as error:
         return {
             "available": False,
-            "provider": SEARCH_ENV_DEFAULTS["SEARCH_PROVIDER"],
+            "provider": config.provider,
             "message": search_verify_error_message(error),
         }
 
@@ -745,6 +892,87 @@ async def verify_search_config(config: SearchConfigRequest):
 @api_router.get("/api/samples")
 def samples():
     return SAMPLES
+
+
+def trim_imported_content(text_value: str) -> str:
+    """Keep extracted paragraphs within the same input limit as manual articles."""
+    paragraphs = [paragraph.strip() for paragraph in text_value.splitlines() if paragraph.strip()]
+    if not paragraphs:
+        return ""
+    selected: list[str] = []
+    current_length = 0
+    for paragraph in paragraphs:
+        separator_length = 1 if selected else 0
+        remaining = MAX_ARTICLE_CONTENT_CHARACTERS - current_length - separator_length
+        if remaining <= 0:
+            break
+        if len(paragraph) > remaining:
+            selected.append(paragraph[:remaining].rstrip())
+            break
+        selected.append(paragraph)
+        current_length += len(paragraph) + separator_length
+    return "\n".join(selected)
+
+
+def media_resource_kind(url: str) -> str | None:
+    """Identify direct media files without blocking HTML news pages that contain media."""
+    path = urlparse(url).path.lower()
+    for kind, extensions in MEDIA_RESOURCE_EXTENSIONS.items():
+        if any(path.endswith(extension) for extension in extensions):
+            return kind
+    return None
+
+
+def is_known_dynamic_article_url(url: str) -> bool:
+    """Recognize publishers whose article content is assembled only after page scripts run."""
+    hostname = (urlparse(url).hostname or "").lower()
+    return any(hostname == host or hostname.endswith(f".{host}") for host in KNOWN_DYNAMIC_ARTICLE_HOSTS)
+
+
+@api_router.post("/api/articles/import")
+async def import_article(request: ArticleImportRequest):
+    resource_kind = media_resource_kind(request.url)
+    if resource_kind == "image":
+        raise HTTPException(
+            status_code=422,
+            detail="该链接是图片资源，无法提取新闻正文。请提供对应新闻报道网页链接或手动粘贴文字稿。",
+        )
+    if resource_kind == "video":
+        raise HTTPException(
+            status_code=422,
+            detail="该链接是视频资源，无法提取新闻正文。请提供对应新闻报道网页链接或手动粘贴文字稿。",
+        )
+    try:
+        async with httpx.AsyncClient() as client:
+            article = await fetch_public_page(client, request.url)
+    except (httpx.HTTPError, ValueError):
+        article = None
+    if not article:
+        if is_known_dynamic_article_url(request.url):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "该 MSN 新闻页需要在浏览器中动态加载正文，当前无法可靠提取。"
+                    "请粘贴原始发布媒体的报道链接，或手动复制标题和文字正文。"
+                ),
+            )
+        raise HTTPException(
+            status_code=422,
+            detail="无法提取该链接的公开新闻正文，请确认链接可直接访问，或手动粘贴正文。",
+        )
+    content = trim_imported_content(article["text"])
+    if len(content.replace(" ", "").replace("\n", "")) < 80:
+        raise HTTPException(
+            status_code=422,
+            detail="该页面未提供足够的可用正文，请手动粘贴新闻内容。",
+        )
+    return {
+        "title": article["title"],
+        "content": content,
+        "source_url": article["url"],
+        "source_domain": article["domain"],
+        "retrieved_at": datetime.now().isoformat(),
+    }
 
 
 @api_router.get("/api/benchmarks/overview")
@@ -796,6 +1024,7 @@ async def create_verification(request: VerificationRequest):
             request.title,
             request.content,
             os.environ.get("SEARCH_API_KEY", ""),
+            provider=get_search_provider(configured_search_provider()),
         )
     except SummarizationError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -879,36 +1108,45 @@ def get_history(
     return [serialize_record(record) for record in records]
 
 
+@api_router.get("/api/history/backup")
+def export_history_backup(session: Session = Depends(get_session)):
+    records = session.query(HistoryRecord).order_by(desc(HistoryRecord.created_at)).all()
+    return {
+        "format_version": 1,
+        "exported_at": datetime.now().isoformat(),
+        "records": [serialize_backup_record(record) for record in records],
+    }
+
+
+@api_router.post("/api/history/import")
+def import_history_backup(request: HistoryImportRequest, session: Session = Depends(get_session)):
+    existing_fingerprints = {
+        (record.content, record.summary) for record in session.query(HistoryRecord).all()
+    }
+    imported = 0
+    skipped = 0
+    for item in request.records:
+        fingerprint = (item.content, item.result.summary)
+        if fingerprint in existing_fingerprints:
+            skipped += 1
+            continue
+        session.add(
+            create_history_record(
+                item,
+                favorite=item.favorite,
+                rating=item.rating,
+                created_at=item.created_at,
+            )
+        )
+        existing_fingerprints.add(fingerprint)
+        imported += 1
+    session.commit()
+    return {"imported": imported, "skipped": skipped}
+
+
 @api_router.post("/api/history", status_code=201)
 def save_history(request: HistoryCreateRequest, session: Session = Depends(get_session)):
-    result = request.result
-    record = HistoryRecord(
-        title=result.title or request.title,
-        content=request.content,
-        summary=result.summary,
-        bullets_json=json.dumps(
-            [bullet.model_dump() for bullet in result.bullets], ensure_ascii=False
-        ),
-        keywords_json=json.dumps(result.keywords, ensure_ascii=False),
-        selected_ids_json=json.dumps(result.selected_sentence_ids),
-        source_sentences_json=json.dumps(
-            [sentence.model_dump() for sentence in result.source_sentences], ensure_ascii=False
-        ),
-        quality_json=json.dumps(result.quality.model_dump()),
-        facts_json=json.dumps([fact.model_dump() for fact in result.facts], ensure_ascii=False),
-        constraints_json=json.dumps(result.selection_constraints.model_dump()),
-        verification_json=json.dumps(
-            result.verification.model_dump() if result.verification else None,
-            ensure_ascii=False,
-        ),
-        length=request.length,
-        engine=result.engine,
-        engine_label=result.engine_label,
-        original_characters=result.metrics.original_characters,
-        summary_characters=result.metrics.summary_characters,
-        compression_ratio=str(result.metrics.compression_ratio),
-        processing_ms=result.processing_ms,
-    )
+    record = create_history_record(request)
     session.add(record)
     session.commit()
     session.refresh(record)
@@ -956,7 +1194,7 @@ def create_app(
     """Create a runnable app with an optional isolated SQLite target."""
     if database_url:
         configure_database(database_url)
-    application = FastAPI(title="NewsBrief API", version="2.2.0", lifespan=lifespan)
+    application = FastAPI(title="NewsBrief API", version="2.4.0", lifespan=lifespan)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=[

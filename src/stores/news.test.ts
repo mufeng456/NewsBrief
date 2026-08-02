@@ -79,6 +79,8 @@ const fixtures = vi.hoisted(() => {
       ...detailedResult,
       id: 99,
       content: '这是一段用于验证保存版本的中文新闻正文内容。',
+      source_url: null,
+      source_domain: null,
       length: 'detailed' as const,
       favorite: false,
       rating: null,
@@ -94,6 +96,14 @@ vi.mock('../api', () => ({
     verifyAI: vi.fn(),
     configureSearch: vi.fn(),
     verifySearch: vi.fn(),
+    importArticle: vi.fn().mockResolvedValue({
+      title: '链接导入新闻',
+      content:
+        '这是一段从公开新闻链接导入的中文正文内容，用于验证标题、正文与来源信息能够在编辑器中保持可编辑，并可继续进入本地摘要流程。',
+      source_url: 'https://news.example.com/article/1',
+      source_domain: 'news.example.com',
+      retrieved_at: '2026-08-01T08:00:00',
+    }),
     getSamples: vi.fn(),
     getHistory: vi.fn().mockResolvedValue([]),
     summarize: vi.fn().mockResolvedValue(fixtures.summaryResult),
@@ -182,6 +192,32 @@ describe('news store', () => {
     expect(store.currentResult).toBeNull()
   })
 
+  it('imports an article into the editable draft without creating history', async () => {
+    const store = useNewsStore()
+
+    const imported = await store.importArticle('https://example.com/news')
+
+    expect(imported).toBe(true)
+    expect(api.importArticle).toHaveBeenLastCalledWith('https://example.com/news')
+    expect(store.draft.title).toBe('链接导入新闻')
+    expect(store.draft.source_domain).toBe('news.example.com')
+    expect(store.history).toEqual([])
+  })
+
+  it('keeps the draft and surfaces a readable import failure', async () => {
+    const store = useNewsStore()
+    store.draft.content = '保留原有编辑内容，导入失败时不应替换用户已经输入的新闻正文。'
+    vi.mocked(api.importArticle).mockRejectedValueOnce(
+      new Error('无法提取公开新闻正文，请手动粘贴。'),
+    )
+
+    const imported = await store.importArticle('https://example.com/unavailable')
+
+    expect(imported).toBe(false)
+    expect(store.draft.content).toContain('保留原有编辑内容')
+    expect(store.error).toBe('无法提取公开新闻正文，请手动粘贴。')
+  })
+
   it('stores a generated summary result for the workbench', async () => {
     const store = useNewsStore()
     store.draft.content =
@@ -191,12 +227,41 @@ describe('news store', () => {
     expect(store.currentResult?.engine).toBe('local')
     expect(store.currentResult?.quality.evidence_coverage).toBe(100)
     expect(store.error).toBe('')
+    expect(api.summarize).toHaveBeenLastCalledWith({
+      title: '',
+      content: store.draft.content,
+      length: 'standard',
+      engine: 'local',
+      selection_constraints: { pinned_sentence_ids: [], excluded_sentence_ids: [] },
+    })
   })
 
   it('requests rating-priority history when selected', async () => {
     const store = useNewsStore()
     await store.refreshHistory('', false, 'rating')
     expect(api.getHistory).toHaveBeenLastCalledWith('', false, 'rating')
+  })
+
+  it('saves the selected domestic search provider without retaining the key in state', async () => {
+    vi.mocked(api.configureSearch).mockResolvedValueOnce({
+      verification_engine: {
+        enabled: true,
+        provider: 'bocha',
+        provider_label: '博查 Web Search（国内默认）',
+        label: '公开来源核验',
+        message: '已配置博查 Web Search（国内默认），可在核验线索中主动检索公开来源。',
+        max_sources: 6,
+      },
+    } as never)
+    const store = useNewsStore()
+
+    await store.configureSearch({ provider: 'bocha', api_key: 'key-not-kept-in-store' })
+
+    expect(api.configureSearch).toHaveBeenLastCalledWith({
+      provider: 'bocha',
+      api_key: 'key-not-kept-in-store',
+    })
+    expect(store.capabilities?.verification_engine.provider).toBe('bocha')
   })
 
   it('applies mutually exclusive evidence constraints to the draft', () => {

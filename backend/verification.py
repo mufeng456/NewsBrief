@@ -10,11 +10,12 @@ import asyncio
 import copy
 import hashlib
 import ipaddress
+import json
 import re
 import socket
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import httpx
@@ -24,6 +25,7 @@ from .facts import extract_facts
 from .summarizer import analyze_news, split_sentences, tokenize
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+BOCHA_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
 MAX_QUERIES = 3
 MAX_SEARCH_RESULTS = 8
 MAX_SOURCES = 6
@@ -31,6 +33,58 @@ MAX_REDIRECTS = 3
 MAX_SOURCE_BYTES = 1_500_000
 SOURCE_TIMEOUT = 6.0
 VERIFICATION_TIMEOUT = 20.0
+EMBEDDED_CONTENTDATE_PATTERN = re.compile(
+    r"(?:var|let|const)\s+contentdate\s*=\s*'(?P<content>(?:\\.|[^'])*)'\s*;?",
+    re.IGNORECASE | re.DOTALL,
+)
+EMBEDDED_CONTENTDATE_DOUBLE_QUOTE_PATTERN = re.compile(
+    r'(?:var|let|const)\s+contentdate\s*=\s*"(?P<content>(?:\\.|[^\"])*)"\s*;?',
+    re.IGNORECASE | re.DOTALL,
+)
+META_CHARSET_PATTERN = re.compile(
+    br"<meta[^>]+charset=[\"']?([a-zA-Z0-9_-]+)", re.IGNORECASE
+)
+CONTENT_SELECTORS = (
+    "[itemprop='articleBody']",
+    "article",
+    "#artibody",
+    "#articleContent",
+    "#article-content",
+    "#article_content",
+    "#content_area",
+    "#contentText",
+    "#content-text",
+    "#main-content",
+    "#mainContent",
+    "#UCAP-CONTENT",
+    "#Cnt-Main-Article-QQ",
+    "#endText",
+    "#ozoom",
+    ".article-content",
+    ".articleContent",
+    ".article_body",
+    ".article-body",
+    ".articleBody",
+    ".article_txt",
+    ".article-text",
+    ".articleText",
+    ".article-main",
+    ".content-article",
+    ".content-detail",
+    ".content-main",
+    ".news-content",
+    ".newsContent",
+    ".news_detail",
+    ".TRS_Editor",
+    ".post_content",
+    ".rich_media_content",
+)
+CONTENT_NOISE_PATTERN = re.compile(
+    r"^(?:责任编辑|编辑|原标题|来源|版权声明|特别声明|更多精彩|相关阅读|推荐阅读|点击进入|"
+    r"本文转自|扫码|分享至|客户端|下载客户端|举报|收藏|打印|关闭|返回顶部)[:：\s]",
+    re.IGNORECASE,
+)
+ARTICLE_SCHEMA_TYPES = {"article", "newsarticle", "reportage", "blogposting"}
 CACHE_SECONDS = 600
 
 ESTABLISHED_MEDIA_DOMAINS = {
@@ -173,17 +227,221 @@ def source_tier(domain: str) -> str:
     return "other"
 
 
+def _clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
+
+
+def _deduplicate_paragraphs(paragraphs: list[str], minimum_length: int = 14) -> list[str]:
+    """Keep readable article paragraphs while dropping common page chrome."""
+    selected: list[str] = []
+    seen: set[str] = set()
+    for raw_paragraph in paragraphs:
+        paragraph = _clean_text(raw_paragraph)
+        fingerprint = re.sub(r"[\W_]+", "", paragraph)
+        if (
+            len(paragraph) < minimum_length
+            or len(fingerprint) < minimum_length
+            or "htmlVideoCode" in paragraph
+            or CONTENT_NOISE_PATTERN.search(paragraph)
+            or fingerprint in seen
+        ):
+            continue
+        seen.add(fingerprint)
+        selected.append(paragraph)
+    return selected
+
+
+def _paragraphs_from_node(node: Any, minimum_length: int = 14) -> list[str]:
+    paragraph_tags = node.find_all("p")
+    if paragraph_tags:
+        values = [paragraph.get_text(" ", strip=True) for paragraph in paragraph_tags]
+    else:
+        values = node.get_text("\n", strip=True).splitlines()
+    return _deduplicate_paragraphs(values, minimum_length)
+
+
+def _unescape_script_html(value: str) -> str:
+    """Decode common JavaScript string escapes without evaluating any script."""
+
+    def decode_unicode(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 16))
+
+    value = re.sub(r"\\u([0-9a-fA-F]{4})", decode_unicode, value)
+    value = re.sub(r"\\x([0-9a-fA-F]{2})", decode_unicode, value)
+    return (
+        value.replace(r"\'", "'")
+        .replace(r'\"', '"')
+        .replace(r"\/", "/")
+        .replace(r"\n", "\n")
+        .replace(r"\r", "\r")
+        .replace(r"\t", " ")
+    )
+
+
+def _embedded_contentdate_paragraphs(html: str) -> list[str]:
+    """Read CCTV-style inline article HTML without executing page scripts."""
+    for pattern in (EMBEDDED_CONTENTDATE_PATTERN, EMBEDDED_CONTENTDATE_DOUBLE_QUOTE_PATTERN):
+        match = pattern.search(html)
+        if match:
+            content_html = _unescape_script_html(match.group("content"))
+            return _paragraphs_from_node(BeautifulSoup(content_html, "html.parser"))
+    return []
+
+
+def _paragraphs_from_article_value(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    fragment = BeautifulSoup(value, "html.parser")
+    paragraphs = _paragraphs_from_node(fragment)
+    if paragraphs:
+        return paragraphs
+    return _deduplicate_paragraphs(value.splitlines())
+
+
+def _walk_json_objects(payload: Any) -> list[dict[str, Any]]:
+    """Bound traversal of JSON-LD and framework state data embedded in a page."""
+    objects: list[dict[str, Any]] = []
+    pending = [payload]
+    while pending and len(objects) < 800:
+        current = pending.pop()
+        if isinstance(current, dict):
+            objects.append(current)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current[:80])
+    return objects
+
+
+def _article_schema_types(value: Any) -> set[str]:
+    values = value if isinstance(value, list) else [value]
+    return {str(item).lower() for item in values if item}
+
+
+def _json_article_candidates(soup: BeautifulSoup) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    candidates: list[tuple[str, list[str]]] = []
+    titles: list[str] = []
+    for script in soup.find_all("script"):
+        script_type = str(script.get("type", "")).lower()
+        script_id = str(script.get("id", "")).lower()
+        if script_type not in {"application/ld+json", "application/json"} and script_id != "__next_data__":
+            continue
+        raw_json = script.string or script.get_text(strip=True)
+        if not raw_json or len(raw_json) > MAX_SOURCE_BYTES:
+            continue
+        try:
+            # Some publishers leave literal line breaks inside an otherwise usable data block.
+            payload = json.loads(raw_json, strict=False)
+        except json.JSONDecodeError:
+            continue
+        for item in _walk_json_objects(payload):
+            schema_types = _article_schema_types(item.get("@type") or item.get("type"))
+            body = item.get("articleBody") or item.get("article_body")
+            if not body and schema_types & ARTICLE_SCHEMA_TYPES:
+                body = item.get("content") or item.get("body")
+            paragraphs = _paragraphs_from_article_value(body)
+            if paragraphs:
+                candidates.append(("structured-data", paragraphs))
+                headline = _clean_text(str(item.get("headline") or item.get("name") or ""))
+                if headline:
+                    titles.append(headline)
+    return candidates, titles
+
+
+def _metadata_title(soup: BeautifulSoup) -> str:
+    for attribute, name in (
+        ("property", "og:title"),
+        ("name", "twitter:title"),
+        ("name", "parsely-title"),
+    ):
+        tag = soup.find("meta", attrs={attribute: name})
+        if tag and tag.get("content"):
+            title = _clean_text(str(tag["content"]))
+            if title:
+                return title
+    heading = soup.find("h1")
+    if heading:
+        title = _clean_text(heading.get_text(" ", strip=True))
+        if title:
+            return title
+    return ""
+
+
+def _candidate_score(method: str, paragraphs: list[str]) -> int:
+    text_length = len("".join(paragraphs))
+    method_priority = {
+        "structured-data": 640,
+        "embedded-contentdate": 620,
+        "semantic-container": 440,
+        "page-paragraphs": 0,
+    }[method]
+    return method_priority + min(text_length // 8, 620) + min(len(paragraphs) * 40, 360)
+
+
+def _select_article_text(candidates: list[tuple[str, list[str]]]) -> str:
+    valid_candidates = [
+        (method, paragraphs)
+        for method, paragraphs in candidates
+        if len("".join(paragraphs)) >= 40
+    ]
+    if not valid_candidates:
+        return ""
+    _, paragraphs = max(valid_candidates, key=lambda item: _candidate_score(*item))
+    return "\n".join(paragraphs[:120])[:18_000]
+
+
 def _extract_page(html: str, fallback_title: str) -> tuple[str, str]:
+    """Extract a readable article with progressively less specific static strategies."""
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header"]):
+    structured_candidates, structured_titles = _json_article_candidates(soup)
+    candidates = structured_candidates
+    embedded_paragraphs = _embedded_contentdate_paragraphs(html)
+    if embedded_paragraphs:
+        candidates.append(("embedded-contentdate", embedded_paragraphs))
+
+    for tag in soup(
+        ["script", "style", "noscript", "svg", "nav", "footer", "header", "aside", "form", "template"]
+    ):
         tag.decompose()
-    title = soup.title.get_text(" ", strip=True) if soup.title else fallback_title
-    paragraphs = [item.get_text(" ", strip=True) for item in soup.find_all("p")]
-    paragraphs = [item for item in paragraphs if len(item) >= 24]
-    text = "\n".join(paragraphs[:80])
+    for selector in CONTENT_SELECTORS:
+        for container in soup.select(selector)[:8]:
+            paragraphs = _paragraphs_from_node(container)
+            if paragraphs:
+                candidates.append(("semantic-container", paragraphs))
+    page_paragraphs = _paragraphs_from_node(soup, minimum_length=24)
+    if page_paragraphs:
+        candidates.append(("page-paragraphs", page_paragraphs))
+
+    title = _metadata_title(soup)
+    if not title and structured_titles:
+        title = structured_titles[0]
+    if not title and soup.title:
+        title = _clean_text(soup.title.get_text(" ", strip=True))
+    text = _select_article_text(candidates)
     if not text:
-        text = soup.get_text(" ", strip=True)
-    return title[:180], text[:18_000]
+        text = _clean_text(soup.get_text(" ", strip=True))[:18_000]
+    return (title or fallback_title)[:180], text
+
+
+def _decode_page_html(raw_html: bytes, content_type: str) -> str:
+    """Decode common news-page encodings before HTML parsing."""
+    header_match = re.search(r"charset\s*=\s*([a-zA-Z0-9_-]+)", content_type, re.IGNORECASE)
+    meta_match = META_CHARSET_PATTERN.search(raw_html[:16_000])
+    candidates = [
+        meta_match.group(1).decode("ascii", errors="ignore") if meta_match else "",
+        header_match.group(1) if header_match else "",
+        "utf-8",
+        "gb18030",
+        "big5",
+        "latin-1",
+    ]
+    for encoding in dict.fromkeys(candidate.lower().replace("gb2312", "gb18030") for candidate in candidates):
+        if not encoding:
+            continue
+        try:
+            return raw_html.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw_html.decode("utf-8", errors="replace")
 
 
 async def fetch_public_page(
@@ -225,7 +483,7 @@ async def fetch_public_page(
                     chunks.append(chunk)
         except (httpx.HTTPError, ValueError):
             return None
-        raw_html = b"".join(chunks).decode("utf-8", errors="ignore")
+        raw_html = _decode_page_html(b"".join(chunks), content_type)
         title, text = _extract_page(raw_html, urlparse(current_url).netloc)
         if len(text) < 40:
             return None
@@ -241,8 +499,51 @@ async def fetch_public_page(
     return None
 
 
+class SearchProvider(Protocol):
+    """Minimal interface shared by public-web search adapters."""
+
+    name: str
+
+    async def search(
+        self, client: httpx.AsyncClient, query: str, api_key: str
+    ) -> list[dict[str, str]]: ...
+
+
+class BochaSearchProvider:
+    """Adapter for Bocha's structured Web Search API, the domestic default."""
+
+    name = "bocha"
+
+    async def search(
+        self, client: httpx.AsyncClient, query: str, api_key: str
+    ) -> list[dict[str, str]]:
+        response = await client.post(
+            BOCHA_SEARCH_URL,
+            headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+            json={"query": query, "summary": True, "count": MAX_SEARCH_RESULTS},
+            timeout=SOURCE_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data", payload)
+        results = data.get("webPages", {}).get("value", []) if isinstance(data, dict) else []
+        return [
+            {
+                "title": str(item.get("name") or item.get("title") or "")[:180],
+                "url": str(item.get("url") or item.get("id") or ""),
+                "description": str(
+                    item.get("snippet") or item.get("summary") or item.get("description") or ""
+                )[:500],
+            }
+            for item in results[:MAX_SEARCH_RESULTS]
+            if isinstance(item, dict) and (item.get("url") or item.get("id"))
+        ]
+
+
 class BraveSearchProvider:
     """Small adapter around Brave's documented JSON web-search endpoint."""
+
+    name = "brave"
 
     async def search(
         self, client: httpx.AsyncClient, query: str, api_key: str
@@ -265,6 +566,17 @@ class BraveSearchProvider:
             for item in results[:MAX_SEARCH_RESULTS]
             if item.get("url")
         ]
+
+
+def get_search_provider(provider_name: str) -> SearchProvider:
+    providers: dict[str, SearchProvider] = {
+        "bocha": BochaSearchProvider(),
+        "brave": BraveSearchProvider(),
+    }
+    try:
+        return providers[provider_name.strip().lower()]
+    except KeyError as error:
+        raise VerificationError("不支持的公开来源检索服务。") from error
 
 
 def _match_score(claim_text: str, source_text: str) -> float:
@@ -358,7 +670,7 @@ async def run_online_verification(
     content: str,
     api_key: str,
     *,
-    provider: BraveSearchProvider | None = None,
+    provider: SearchProvider | None = None,
     client: httpx.AsyncClient | None = None,
     fetcher: Fetcher | None = None,
 ) -> dict[str, Any]:
@@ -366,7 +678,9 @@ async def run_online_verification(
     offline = offline_verification_for_article(title, content)
     if not api_key.strip():
         return offline
-    cache_key = hashlib.sha256(f"{title}\n{content}".encode()).hexdigest()
+    provider = provider or BochaSearchProvider()
+    provider_name = getattr(provider, "name", "custom")
+    cache_key = hashlib.sha256(f"{provider_name}\n{title}\n{content}".encode()).hexdigest()
     cached = _cache.get(cache_key)
     if cached and cached[0] > time.monotonic():
         return copy.deepcopy(cached[1])
@@ -375,7 +689,6 @@ async def run_online_verification(
         offline["notice"] = "无法从当前新闻中生成可用于公开检索的短查询。"
         return offline
 
-    provider = provider or BraveSearchProvider()
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=SOURCE_TIMEOUT)
     fetcher = fetcher or fetch_public_page
@@ -413,13 +726,13 @@ async def run_online_verification(
             await client.aclose()
 
 
-async def verify_brave_connection(api_key: str) -> dict[str, Any]:
-    """Run the smallest possible request without persisting the supplied key."""
-    provider = BraveSearchProvider()
+async def verify_search_connection(provider_name: str, api_key: str) -> dict[str, Any]:
+    """Run the smallest possible provider request without persisting the supplied key."""
+    provider = get_search_provider(provider_name)
     async with httpx.AsyncClient(timeout=SOURCE_TIMEOUT) as client:
-        await provider.search(client, "NewsBrief", api_key)
+        await provider.search(client, "NewsBrief 公开来源检索", api_key)
     return {
         "available": True,
-        "provider": "brave",
+        "provider": provider.name,
         "message": "公开来源检索服务连接成功。",
     }

@@ -146,7 +146,8 @@ export interface CapabilityResponse {
   }
   verification_engine: {
     enabled: boolean
-    provider: string
+    provider: SearchProvider
+    provider_label: string
     label: string
     message: string
     max_sources: number
@@ -167,8 +168,11 @@ export interface AIConfigVerification {
 }
 
 export interface SearchConfigPayload {
+  provider: SearchProvider
   api_key: string
 }
+
+export type SearchProvider = 'bocha' | 'brave'
 
 export interface SearchConfigVerification {
   available: boolean
@@ -179,15 +183,50 @@ export interface SearchConfigVerification {
 export interface HistoryRecord extends SummaryResult {
   id: number
   content: string
+  source_url: string | null
+  source_domain: string | null
   length: SummaryLength
   favorite: boolean
   rating: number | null
   created_at: string
 }
 
+export interface HistoryBackupRecord {
+  title: string
+  content: string
+  source_url: string | null
+  source_domain: string | null
+  length: SummaryLength
+  favorite: boolean
+  rating: number | null
+  created_at: string
+  result: SummaryResult
+}
+
+export interface HistoryBackup {
+  format_version: 1
+  exported_at: string
+  records: HistoryBackupRecord[]
+}
+
+export interface HistoryImportResult {
+  imported: number
+  skipped: number
+}
+
+export interface ArticleImportResult {
+  title: string
+  content: string
+  source_url: string
+  source_domain: string
+  retrieved_at: string
+}
+
 export interface Draft {
   title: string
   content: string
+  source_url: string | null
+  source_domain: string | null
   length: SummaryLength
   engine: SummaryEngine
   selection_constraints: SelectionConstraints

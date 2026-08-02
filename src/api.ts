@@ -1,9 +1,12 @@
 import type {
   AIConfigPayload,
   AIConfigVerification,
+  ArticleImportResult,
   SearchConfigPayload,
   SearchConfigVerification,
   CapabilityResponse,
+  HistoryBackup,
+  HistoryImportResult,
   HistoryRecord,
   HistorySort,
   NewsSample,
@@ -25,7 +28,18 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   })
   if (response.status === 204) return undefined as T
   const payload = await response.json().catch(() => ({ detail: '服务返回了无法识别的内容。' }))
-  if (!response.ok) throw new Error(payload.detail ?? '请求未能完成。')
+  if (!response.ok) {
+    const detail = payload.detail
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : Array.isArray(detail)
+          ? detail
+              .map((item) => (typeof item?.msg === 'string' ? item.msg : '请求参数无效。'))
+              .join('；')
+          : '请求未能完成。'
+    throw new Error(message)
+  }
   return payload as T
 }
 
@@ -48,6 +62,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  importArticle: (url: string) =>
+    request<ArticleImportResult>('/articles/import', {
+      method: 'POST',
+      body: JSON.stringify({ url }),
+    }),
   getSamples: () => request<NewsSample[]>('/samples'),
   getHistory: (search = '', favorite?: boolean, sort: HistorySort = 'latest') => {
     const query = new URLSearchParams()
@@ -56,6 +75,12 @@ export const api = {
     if (sort !== 'latest') query.set('sort', sort)
     return request<HistoryRecord[]>(`/history${query.size ? `?${query.toString()}` : ''}`)
   },
+  exportHistoryBackup: () => request<HistoryBackup>('/history/backup'),
+  importHistoryBackup: (payload: HistoryBackup) =>
+    request<HistoryImportResult>('/history/import', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   summarize: (payload: {
     title: string
     content: string
@@ -85,6 +110,8 @@ export const api = {
   saveHistory: (payload: {
     title: string
     content: string
+    source_url: string | null
+    source_domain: string | null
     length: SummaryLength
     result: SummaryResult
   }) => {
@@ -127,6 +154,8 @@ export const api = {
       body: JSON.stringify({
         title: payload.title,
         content: payload.content,
+        source_url: payload.source_url,
+        source_domain: payload.source_domain,
         length: payload.length,
         result,
       }),

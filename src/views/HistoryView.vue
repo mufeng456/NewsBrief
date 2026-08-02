@@ -6,20 +6,23 @@ import {
   Bookmark,
   Copy,
   Download,
+  ExternalLink,
   FolderOpen,
   Heart,
   Search,
   Star,
   Trash2,
+  Upload,
 } from '@lucide/vue'
 import { useNewsStore } from '../stores/news'
-import type { HistoryRecord, HistorySort } from '../types'
+import type { HistoryBackup, HistoryRecord, HistorySort } from '../types'
 
 const store = useNewsStore()
 const router = useRouter()
 const search = ref('')
 const favoritesOnly = ref(false)
 const sort = ref<HistorySort>('latest')
+const backupInput = ref<HTMLInputElement | null>(null)
 const records = computed(() => store.history)
 
 onMounted(async () => {
@@ -64,11 +67,51 @@ async function copy(record: HistoryRecord) {
 
 function download(record: HistoryRecord) {
   const link = document.createElement('a')
-  const text = `${record.title}\n\n${record.summary}\n\n关键词：${record.keywords.join('、')}`
+  const text = [
+    record.title,
+    '',
+    record.summary,
+    '',
+    `关键词：${record.keywords.join('、')}`,
+    ...(record.source_url ? [`原始新闻链接：${record.source_url}`] : []),
+  ].join('\n')
   link.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
   link.download = `${record.title.slice(0, 24)}.txt`
   link.click()
   URL.revokeObjectURL(link.href)
+}
+
+async function exportBackup() {
+  const backup = await store.exportHistoryBackup()
+  if (!backup) return
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(
+    new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json;charset=utf-8' }),
+  )
+  link.download = `newsbrief-history-${new Date().toISOString().slice(0, 10)}.json`
+  link.click()
+  URL.revokeObjectURL(link.href)
+  store.notice = `已导出 ${backup.records.length} 条本机历史记录。`
+}
+
+function selectBackupFile() {
+  backupInput.value?.click()
+}
+
+async function importBackup(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  try {
+    const backup = JSON.parse(await file.text()) as HistoryBackup
+    if (!window.confirm('导入会合并新记录，并跳过重复内容。是否继续？')) return
+    const outcome = await store.importHistoryBackup(backup)
+    if (outcome) await applyFilters()
+  } catch (reason) {
+    store.error =
+      reason instanceof Error ? `读取备份文件失败：${reason.message}` : '读取备份文件失败。'
+  }
 }
 
 async function remove(record: HistoryRecord) {
@@ -88,9 +131,34 @@ async function clearAll() {
       <p class="eyebrow">本机存储</p>
       <h1>历史记录</h1>
     </div>
-    <button v-if="records.length" class="danger-button" type="button" @click="clearAll">
-      <Trash2 :size="16" />清空记录
-    </button>
+    <div class="history-heading-actions">
+      <input
+        ref="backupInput"
+        class="visually-hidden"
+        type="file"
+        accept="application/json,.json"
+        @change="importBackup"
+      />
+      <button
+        class="filter-button history-backup-button"
+        type="button"
+        title="导入本机历史备份"
+        @click="selectBackupFile"
+      >
+        <Upload :size="16" />导入备份
+      </button>
+      <button
+        class="filter-button history-backup-button"
+        type="button"
+        title="导出全部本机历史记录"
+        @click="exportBackup"
+      >
+        <Download :size="16" />导出备份
+      </button>
+      <button v-if="records.length" class="danger-button" type="button" @click="clearAll">
+        <Trash2 :size="16" />清空记录
+      </button>
+    </div>
   </section>
   <section class="history-toolbar" aria-label="历史记录筛选">
     <label class="search-box"
@@ -124,6 +192,15 @@ async function clearAll() {
           <span class="engine-badge" :class="record.engine">{{ record.engine_label }}</span
           ><time>{{ new Date(record.created_at).toLocaleString('zh-CN') }}</time>
         </div>
+        <a
+          v-if="record.source_url"
+          class="history-source"
+          :href="record.source_url"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <ExternalLink :size="13" />{{ record.source_domain || '原始新闻链接' }}
+        </a>
         <h2>{{ record.title }}</h2>
         <p>{{ record.summary }}</p>
         <div class="history-bottom">
