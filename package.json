@@ -12,8 +12,8 @@
     "test": "npm run test:backend && npm run test:frontend && npm run build",
     "lint": "eslint src --max-warnings=0",
     "lint:backend": "python -m ruff check backend",
-    "format": "prettier --write .github .prettierrc.json .vscode CHANGELOG.md README.md backend docs eslint.config.js index.html package.json public src tsconfig.app.json tsconfig.json tsconfig.node.json vite.config.ts",
-    "format:check": "prettier --check .github .prettierrc.json .vscode CHANGELOG.md README.md backend docs eslint.config.js index.html package.json public src tsconfig.app.json tsconfig.json tsconfig.node.json vite.config.ts"
+    "format": "prettier --write .github .prettierrc.json .vscode CHANGELOG.md README.md backend eslint.config.js index.html package.json public src tsconfig.app.json tsconfig.json tsconfig.node.json vite.config.ts",
+    "format:check": "prettier --check .github .prettierrc.json .vscode CHANGELOG.md README.md backend eslint.config.js index.html package.json public src tsconfig.app.json tsconfig.json tsconfig.node.json vite.config.ts"
   },
   "dependencies": {
     "@lucide/vue": "^1.25.0",

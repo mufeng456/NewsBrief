@@ -4,8 +4,6 @@ NewsBrief 是一个面向中文新闻阅读场景的本地优先摘要工具。�
 
 项目定位为高质量课程实训作品：核心能力可以在无网络、未配置 AI 密钥的环境中完整运行，适合本地展示、课程验收与后续维护。
 
-![NewsBrief 长度对比工作台](docs/screenshots/v14-length-compare-1440.png)
-
 ## 核心功能
 
 - 新闻链接导入：支持粘贴公开 HTTPS 新闻报道页，使用元数据、Schema.org JSON-LD、前端框架内嵌数据、常见新闻正文容器与段落回退提取标题和正文后回填至可编辑工作台；兼容 UTF-8、GB18030/GBK 与 Big5 等常见编码。用户确认后才会生成摘要，来源链接可随历史、备份与导出保留。支持央视网等将正文安全内嵌在静态 HTML 变量中的页面；图片、视频直链和 MSN 等动态装配页会明确提示改用原始报道链接或手动粘贴文字稿。
@@ -48,9 +46,6 @@ NewsBrief/
 ├─ src/                        Vue 工作台、状态管理与页面样式
 │  ├─ views/                   摘要、历史、设置页面
 │  └─ stores/                  摘要与历史工作流状态
-├─ docs/                       报告素材、架构说明与验收截图
-│  ├─ evaluation/              评测数据规范、公开元数据结构
-│  └─ competition/             演示脚本、海报结构与答辩问题库
 ├─ public/                     静态资源
 └─ package.json                前端命令与依赖
 ```
@@ -160,7 +155,7 @@ npm run build
 
 ## 开发规范
 
-提交前依次执行 `npm run format:check`、`npm run lint`、`npm run lint:backend`、`npm run test:backend`、`npm run test:frontend` 与 `npm run build`。前端格式由 Prettier 统一，Python 使用 Ruff 和 `.editorconfig` 的四空格缩进。功能、接口或用户可见行为变更时，同时更新 [更新记录](CHANGELOG.md) 与 [报告素材](docs/项目开发与报告素材.md)。
+提交前依次执行 `npm run format:check`、`npm run lint`、`npm run lint:backend`、`npm run test:backend`、`npm run test:frontend` 与 `npm run build`。前端格式由 Prettier 统一，Python 使用 Ruff 和 `.editorconfig` 的四空格缩进。功能、接口或用户可见行为变更时，同时更新 [更新记录](CHANGELOG.md)。
 
 ## 数据与隐私边界
 
@@ -175,13 +170,7 @@ npm run build
 
 - 使用 `npm run test`、`npm run lint`、`npm run lint:backend` 和 `npm run format:check` 完成代码验收。
 - 使用内置原创样例演示“输入新闻 - 生成摘要 - 查看事实与原文依据 - 长度对比 - 保存与恢复历史”的完整离线流程。
-- 报告正文优先使用 [项目开发与报告素材](docs/项目开发与报告素材.md) 中已验证的技术说明和测试记录；不要将 AI 建议或公开来源核验写成新闻真伪裁决。
 - API Key、`backend/.env`、`backend/newsbrief.db`、构建产物和缓存已在 `.gitignore` 中排除，提交前再次检查 `git status`。
-
-## 报告与截图素材
-
-- [项目开发与报告素材](docs/项目开发与报告素材.md)：需求分析、技术选型、算法说明、接口设计、测试表和版本复盘。
-- [截图目录](docs/screenshots/)：桌面、平板、手机与长度对比的验收截图。
 
 ## License
 

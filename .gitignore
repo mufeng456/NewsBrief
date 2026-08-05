@@ -21,6 +21,9 @@ output/
 dist-ssr
 *.local
 
+# Local course-report materials and QA screenshots
+docs/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
