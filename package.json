@@ -1,0 +1,39 @@
+{
+  "name": "newsbrief",
+  "private": true,
+  "version": "2.5.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "test:backend": "python -m pytest backend/tests -q -p no:cacheprovider",
+    "test:frontend": "vitest run",
+    "test": "npm run test:backend && npm run test:frontend && npm run build",
+    "lint": "eslint src --max-warnings=0",
+    "lint:backend": "python -m ruff check backend",
+    "format": "prettier --write .github .prettierrc.json .vscode CHANGELOG.md README.md backend eslint.config.js index.html package.json public src tsconfig.app.json tsconfig.json tsconfig.node.json vite.config.ts",
+    "format:check": "prettier --check .github .prettierrc.json .vscode CHANGELOG.md README.md backend eslint.config.js index.html package.json public src tsconfig.app.json tsconfig.json tsconfig.node.json vite.config.ts"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.25.0",
+    "pinia": "^4.0.2",
+    "vue": "^3.5.39",
+    "vue-router": "^5.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.13.2",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "@vue/tsconfig": "^0.9.1",
+    "eslint": "^10.7.0",
+    "eslint-plugin-vue": "^10.9.2",
+    "globals": "^17.7.0",
+    "prettier": "3.5.3",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.64.0",
+    "vite": "^8.1.1",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.3.5"
+  }
+}

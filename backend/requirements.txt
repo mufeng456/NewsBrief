@@ -1,0 +1,11 @@
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+sqlalchemy==2.0.39
+jieba==0.42.1
+scikit-learn==1.6.1
+networkx==3.4.2
+httpx==0.28.1
+beautifulsoup4==4.12.3
+openai==2.46.0
+pytest==8.3.4
+ruff==0.12.11
